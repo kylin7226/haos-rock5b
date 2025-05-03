@@ -1,0 +1,8 @@
+
+bootargs=console=tty1 console=ttyS2,1500000 root=/dev/mmcblk1p2 rootwait ro
+bootcmd=run distro_bootcmd
+bootdelay=2
+baudrate=1500000
+stdin=serial
+stdout=serial
+stderr=serial

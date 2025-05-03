@@ -1,0 +1,2 @@
+
+console=tty1 console=ttyS2,1500000 root=/dev/mmcblk1p2 rootwait ro
