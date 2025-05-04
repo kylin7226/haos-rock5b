@@ -1,0 +1,4 @@
+
+# Device Tree Overlays Directory
+Place .dts overlay files here
+Compiled .dtbo files will be generated during build

@@ -1,0 +1,174 @@
+#!/bin/bash
+# HAOS OTA Update Script for Rock5B with Delta Update Support
+
+set -e
+
+VERSION_FILE="/etc/haos-release"
+OTA_LOCK="/var/lock/haos-ota.lock"
+LOG_FILE="/var/log/haos-ota.log"
+STATUS_FILE="/var/lib/rauc/status.json"
+TEMP_DIR="/tmp/haos-update"
+MAX_RETRIES=3
+
+# 日志函数
+log() {
+    local level="$1"
+    local message="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# 清理函数
+cleanup() {
+    rm -rf "$TEMP_DIR"
+    flock -u 100
+}
+
+# 错误处理
+handle_error() {
+    local error_message="$1"
+    log "ERROR" "$error_message"
+    cleanup
+    exit 1
+}
+
+# 检查系统状态
+check_system_status() {
+    # 检查系统负载
+    local load=$(cat /proc/loadavg | cut -d' ' -f1)
+    if (( $(echo "$load > 2.0" | bc -l) )); then
+        handle_error "System load too high: $load"
+    fi
+
+    # 检查可用内存
+    local free_mem=$(free | awk '/Mem:/ {print $4}')
+    if [ "$free_mem" -lt 524288 ]; then
+        handle_error "Insufficient memory: ${free_mem}KB"
+    fi
+
+    # 检查磁盘空间
+    local free_space=$(df -k / | awk 'NR==2 {print $4}')
+    if [ "$free_space" -lt 1048576 ]; then
+        handle_error "Insufficient disk space: ${free_space}KB"
+    fi
+}
+
+# 获取更新信息
+get_update_info() {
+    local api_response
+    api_response=$(curl -s "https://api.github.com/repos/kylin7226/haos-rock5b/releases/latest")
+    if [ $? -ne 0 ]; then
+        handle_error "Failed to fetch update information"
+    fi
+
+    TARGET_VERSION=$(echo "$api_response" | jq -r '.tag_name + "-" + (.assets[] | select(.name | contains("rock5b")) | .updated_at[0:10])')
+    BUNDLE_URL=$(echo "$api_response" | jq -r '.assets[] | select(.name | endswith(".raucb")) | .browser_download_url')
+    DELTA_URL=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("delta")) | .browser_download_url')
+}
+
+# 下载更新包
+download_update() {
+    local url="$1"
+    local output="$2"
+    local description="$3"
+    
+    log "INFO" "Downloading $description from $url"
+    if ! curl -L --fail --retry 3 --progress-bar --output "$output" "$url"; then
+        handle_error "Failed to download $description"
+    fi
+}
+
+# 验证更新包
+verify_update() {
+    local bundle="$1"
+    
+    log "INFO" "Verifying update bundle"
+    if ! rauc info "$bundle"; then
+        handle_error "Update bundle verification failed"
+    fi
+}
+
+# 应用更新
+apply_update() {
+    local bundle="$1"
+    local retry=0
+    
+    while [ $retry -lt $MAX_RETRIES ]; do
+        log "INFO" "Applying update (attempt $((retry+1))/$MAX_RETRIES)"
+        
+        if rauc install "$bundle"; then
+            log "INFO" "Update applied successfully"
+            return 0
+        fi
+        
+        retry=$((retry+1))
+        sleep 10
+    done
+    
+    handle_error "Failed to apply update after $MAX_RETRIES attempts"
+}
+
+# 主函数
+main() {
+    # 获取锁
+    exec 100>$OTA_LOCK || exit 1
+    flock -n 100 || exit 0
+
+    # 创建临时目录
+    mkdir -p "$TEMP_DIR"
+    
+    # 检查系统状态
+    check_system_status
+    
+    # 获取当前版本
+    CURRENT_VERSION=$(cat $VERSION_FILE 2>/dev/null || echo "unknown")
+    
+    # 获取更新信息
+    get_update_info
+    
+    # 检查是否需要更新
+    if [ "$CURRENT_VERSION" == "$TARGET_VERSION" ]; then
+        log "INFO" "System already up to date ($CURRENT_VERSION)"
+        cleanup
+        exit 0
+    fi
+    
+    log "INFO" "Updating from $CURRENT_VERSION to $TARGET_VERSION"
+    
+    # 尝试增量更新
+    if [ -n "$DELTA_URL" ] && [ -f "$STATUS_FILE" ]; then
+        log "INFO" "Attempting delta update"
+        DELTA_BUNDLE="$TEMP_DIR/delta.raucb"
+        
+        if download_update "$DELTA_URL" "$DELTA_BUNDLE" "delta update" && \
+           verify_update "$DELTA_BUNDLE" && \
+           apply_update "$DELTA_BUNDLE"; then
+            echo "$TARGET_VERSION" > $VERSION_FILE
+            log "INFO" "Delta update completed successfully"
+            cleanup
+            exit 0
+        fi
+        
+        log "WARN" "Delta update failed, falling back to full update"
+    fi
+    
+    # 完整更新
+    if [ -n "$BUNDLE_URL" ]; then
+        log "INFO" "Starting full update"
+        FULL_BUNDLE="$TEMP_DIR/update.raucb"
+        
+        download_update "$BUNDLE_URL" "$FULL_BUNDLE" "full update"
+        verify_update "$FULL_BUNDLE"
+        apply_update "$FULL_BUNDLE"
+        
+        echo "$TARGET_VERSION" > $VERSION_FILE
+        log "INFO" "Full update completed successfully"
+    else
+        handle_error "No update bundle available"
+    fi
+    
+    cleanup
+    exit 0
+}
+
+# 启动主程序
+main "$@"

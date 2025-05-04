@@ -1,0 +1,80 @@
+# HAOS Rock5B 代码检查工作流
+name: Build Check
+
+# 触发条件
+on:
+  pull_request:  # PR时触发
+    branches: [ main ]
+  push:  # 推送到main分支时触发
+    branches: [ main ]
+    paths-ignore:  # 忽略以下文件变更
+      - '**.md'
+      - 'docs/**'
+      - '.github/**'
+      - '!.github/workflows/check.yml'  # 不忽略本文件变更
+
+jobs:
+  check:
+    runs-on: ubuntu-latest  # 使用最新Ubuntu运行器
+    name: Build Check
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v3
+
+    - name: 初始化环境
+      run: |
+        # 安装必要工具
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: 验证配置文件
+      run: |
+        # 检查配置文件格式
+        for file in $(find . -name "*.config"); do
+          if ! grep -q "^CONFIG_" "$file" && [ -s "$file" ]; then
+            echo "错误: $file 配置格式无效"
+            exit 1
+          fi
+        done
+
+        # 检查设备树文件
+        for file in $(find . -name "*.dts"); do
+          if ! grep -q "^/dts-v1/" "$file" && [ -s "$file" ]; then
+            echo "警告: $file 可能缺少版本头"
+          fi
+        done
+
+        # 检查脚本语法
+        for file in $(find . -name "*.sh"); do
+          if ! bash -n "$file"; then
+            echo "错误: $file 包含语法错误"
+            exit 1
+          fi
+        done
+
+    - name: 检查构建依赖
+      run: |
+        cd operating-system
+        # 验证配置是否有效
+        if ! make rock5b_defconfig; then
+          echo "错误: 配置失败"
+          exit 1
+        fi
+
+    - name: 通知构建状态
+      if: always()  # 无论成功失败都执行
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const { owner, repo } = context.repo;
+          const run_id = context.runId;
+          const conclusion = "${{ job.status }}";
+          
+          // 在PR中添加构建状态评论
+          await github.rest.repos.createCommitComment({
+            owner,
+            repo,
+            commit_sha: context.sha,
+            body: `构建检查 ${conclusion}\n\n详情: ${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${run_id}`
+          });

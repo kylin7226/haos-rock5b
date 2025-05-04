@@ -1,0 +1,89 @@
+# HAOS Rock5B 构建工作流
+name: HAOS-Rock5B
+
+# 触发条件
+on:
+  workflow_dispatch:  # 手动触发
+  schedule:
+    - cron: '0 18 * * 0'  # 每周日18:00自动构建
+  push:
+    tags:
+      - 'v*'  # 推送v开头的标签时触发
+
+env:
+  RUN_VALIDATION: true  # 启用验证步骤
+
+jobs:
+  build:
+    runs-on: ubuntu-latest  # 使用最新Ubuntu运行器
+    name: Build Rock5B HAOS
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v3
+      
+    - name: 获取HAOS版本
+      id: get_haos_version
+      run: |
+        # 从官方源获取最新稳定版版本号
+        ver=$(curl -s https://version.home-assistant.io/stable.json | jq -r '.hassos."ova"')
+        echo "HASSOS_VERSION=${ver}" >> $GITHUB_ENV
+        
+    - name: 初始化环境
+      run: |
+        # 清理磁盘空间
+        sudo rm -rf /usr/local/lib/android /opt/ghc /var/lib/apt/lists/*
+        sudo apt clean
+        
+        # 更新软件包列表
+        sudo apt-get -qq update -y
+        
+    - name: 克隆源码并修改配置
+      run: |
+        # 克隆HAOS主仓库
+        git clone https://github.com/home-assistant/operating-system.git -b main
+        
+        # 应用Rock5B特定配置
+        cp -r buildroot-external operating-system
+        cd operating-system
+        
+        # 替换为中国镜像源
+        sed -i 's|version.home-assistant.io|mirrors.tuna.tsinghua.edu.cn/home-assistant|g' buildroot-external/package/hassio/hassio.mk
+        
+        # 初始化子模块
+        git submodule update --init
+        
+        # 添加Rock5B特定配置
+        echo "BR2_PACKAGE_UNZIP=y" >> buildroot-external/configs/rock5b_defconfig 
+        echo "BR2_TARGET_LOCALTIME=\"Asia/Shanghai\"" >> buildroot-external/configs/rock5b_defconfig
+
+    - name: 设置Docker Buildx
+      uses: docker/setup-buildx-action@v2
+  
+    - name: 构建镜像
+      shell: 'script -q -e -c "bash {0}"'
+      id: build
+      run: |
+        cd operating-system
+        # 带重试机制的构建
+        max_retries=3
+        count=0
+        until sudo scripts/enter.sh make -j$(($(nproc) + 1)) rock5b; do
+          count=$((count + 1))
+          if [ $count -ge $max_retries ]; then
+            echo "构建失败，已重试 $count 次"
+            exit 1
+          fi
+          echo "构建失败，30秒后重试... (第 $count/$max_retries 次)"
+          sleep 30
+        done
+        
+    - name: 上传镜像到Release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: operating-system/output/images/haos_*
+        tag: ${{ env.HASSOS_VERSION }}
+        overwrite: true
+        file_glob: true
+        body: "为中国地区优化的Home Assistant OS镜像"
